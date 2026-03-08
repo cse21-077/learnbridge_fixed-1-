@@ -88,8 +88,7 @@ async def health_check() -> HealthResponse:
     try:
         cpu_pct  = psutil.cpu_percent(interval=0.1)
         ram      = psutil.virtual_memory()
-        disk     = psutil.disk_usage("C:\\") if settings.environment == "production" \
-                   else psutil.disk_usage("/")
+        disk     = psutil.disk_usage("/")
 
         ram_used_gb  = ram.used / (1024 ** 3)
         ram_total_gb = ram.total / (1024 ** 3)
