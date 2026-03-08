@@ -1,0 +1,11 @@
+# Run tests with:
+# pip install -r requirements.txt pytest pytest-asyncio
+# pytest app/tests/ -v
+
+# FIXED FILES (vs original):
+#   app/services/security.py      — [FIX-1,2] timestamp ms normalisation
+#   app/services/trade_executor.py — [FIX-3,4,5,6] close magic filter + constants
+
+# NEW FILES:
+#   app/tests/test_leanbridge.py  — comprehensive test suite (13 classes, 60+ tests)
+
