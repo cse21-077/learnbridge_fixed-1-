@@ -63,30 +63,60 @@ def get_active_students(trader_id: str) -> list[dict]:
 def get_all_active_students() -> list[dict]:
     """
     Fetch ALL active students across ALL traders.
-    Used when signal does not specify a trader_id.
-    In production, each signal is scoped to one trader.
+    Uses separate queries since risk_profiles and payment_status
+    link to users, not directly to student_accounts.
     """
     supabase = get_supabase()
 
     try:
+        # Get all active student accounts
         result = (
             supabase.table("student_accounts")
-            .select(
-                "*, "
-                "risk_profiles!inner(aggressiveness, max_lot, max_drawdown, "
-                "min_balance, pause_copy, advanced_options, overleverage_max_lot), "
-                "payment_status!inner(subscription_status)"
-            )
+            .select("*")
             .eq("is_active", True)
-            .eq("risk_profiles.pause_copy", False)
-            .eq("payment_status.subscription_status", "active")
             .execute()
         )
-        return result.data or []
+        students = result.data or []
+
+        # Enrich each student with risk profile and payment status
+        enriched = []
+        for student in students:
+            user_id = student.get("user_id")
+
+            # Get risk profile
+            risk = supabase.table("risk_profiles") \
+                .select("aggressiveness, max_lot, max_drawdown, min_balance, pause_copy, advanced_options, overleverage_max_lot") \
+                .eq("user_id", user_id) \
+                .single() \
+                .execute()
+
+            # Get payment status
+            payment = supabase.table("payment_status") \
+                .select("subscription_status") \
+                .eq("user_id", user_id) \
+                .single() \
+                .execute()
+
+            risk_data = risk.data or {}
+            payment_data = payment.data or {}
+
+            # Skip paused or non-active subscriptions
+            if risk_data.get("pause_copy", False):
+                continue
+            if payment_data.get("subscription_status") != "active":
+                continue
+
+            student["risk_profiles"] = risk_data
+            student["payment_status"] = payment_data
+            enriched.append(student)
+
+        logger.info("Fetched %d active students", len(enriched))
+        return enriched
 
     except Exception as e:
         logger.error("Failed to fetch all active students: %s", str(e))
         raise
+
 
 
 # ── Heartbeat Updates ─────────────────────────────────────────
