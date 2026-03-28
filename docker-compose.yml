@@ -1,0 +1,60 @@
+services:
+  fastapi:
+    build: .
+    container_name: leanbridge_api
+    restart: always
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - MT5_SERVER_URL=http://62.169.27.192:5000
+    depends_on:
+      - redis
+    volumes:
+      - ./app:/app/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2
+
+  celery_worker:
+    build: .
+    container_name: leanbridge_celery
+    restart: always
+    env_file:
+      - .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - MT5_SERVER_URL=http://62.169.27.192:5000
+    depends_on:
+      - redis
+    volumes:
+      - ./app:/app/app
+    command: celery -A app.services.celery_app worker --loglevel=info --concurrency=4
+
+  celery_beat:
+    build: .
+    container_name: leanbridge_beat
+    restart: always
+    env_file:
+      - .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - MT5_SERVER_URL=http://62.169.27.192:5000
+    depends_on:
+      - redis
+    volumes:
+      - ./app:/app/app
+    command: celery -A app.services.celery_app beat --loglevel=info
+
+  redis:
+    image: redis:7-alpine
+    container_name: leanbridge_redis
+    restart: always
+    ports:
+      - "127.0.0.1:6379:6379"
