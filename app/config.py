@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     # MT5
     mt5_slippage_deviation: int = 20
     overleverage_threshold: float = 0.50
+    mt5_server_url: str = ""
 
     # Heartbeat thresholds
     heartbeat_warning_seconds: int = 90
