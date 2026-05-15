@@ -2,6 +2,7 @@
 # ============================================================
 # LEAN-BRIDGE — REQUEST & RESPONSE MODELS
 # Pydantic v2 models for all webhook payloads
+# Updated for EA Slave Architecture (v3.0)
 # ============================================================
 
 from pydantic import BaseModel, Field, field_validator
@@ -40,6 +41,7 @@ class TradeData(BaseModel):
     take_profit:   float = Field(..., ge=0)
     ticket_id:     str   = Field(..., min_length=1, max_length=50)
     strategy_type: StrategyType = StrategyType.NORMAL
+    trader_id:     str   = Field(default="aaaaaaa", min_length=1)  # ← ADDED for EA architecture
 
     @field_validator("lot_size")
     @classmethod
@@ -71,6 +73,7 @@ class ClosePayload(BaseModel):
     event:          Literal["trade_close"]
     mentor_ticket:  str   = Field(..., min_length=1)
     symbol:         str   = Field(..., min_length=1)
+    trader_id:      str   = Field(default="aaaaaaa", min_length=1)  # ← ADDED for EA architecture
 
 
 class HeartbeatPayload(BaseModel):
@@ -111,10 +114,10 @@ class HealthComponent(BaseModel):
 
 
 class HealthResponse(BaseModel):
-    status:     Literal["ok", "degraded", "down"]
-    version:    str
+    status:      Literal["ok", "degraded", "down"]
+    version:     str
     environment: str
-    components: dict[str, HealthComponent]
+    components:  dict[str, HealthComponent]
 
 
 class ErrorResponse(BaseModel):

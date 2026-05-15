@@ -1,10 +1,10 @@
 # app/services/trade_executor.py
 # ============================================================
-# LEAN-BRIDGE — PER-STUDENT TRADE EXECUTION (OPTIMIZED v2.0)
+# LEAN-BRIDGE — PER-STUDENT TRADE EXECUTION (EA Architecture v3.0)
 #
 # ARCHITECTURE UPDATE:
-# Now uses /trade/broadcast endpoint for parallel execution.
-# Single HTTP request instead of 53 sequential requests.
+#   OLD: /trade/broadcast → Python workers → mt5.initialize() → IPC timeout
+#   NEW: /signal → file-based → EA inside MT5 → zero IPC
 # ============================================================
 
 import logging
@@ -28,17 +28,32 @@ if not MT5_AVAILABLE:
 
 Outcome = Literal["success", "failed", "skipped", "retried"]
 
-# OPTIMIZED: Reduced timeout from 30s to 5s
 BROADCAST_TIMEOUT = 5
 
 
-# ── MT5 Server HTTP Helpers (OPTIMIZED) ───────────────────────
+# ── MT5 Server HTTP Helpers (NEW EA ARCHITECTURE) ─────────────
+
+def _mt5_signal(payload: dict) -> dict:
+    """
+    Send signal to new EA-based manager at /signal.
+    Fire-and-forget: manager writes files, EA executes asynchronously.
+    """
+    try:
+        response = requests.post(
+            f"{MT5_SERVER_URL}/signal",
+            json=payload,
+            timeout=BROADCAST_TIMEOUT
+        )
+        return response.json()
+    except Exception as e:
+        logger.error("MT5 signal request failed: %s", str(e))
+        return {"status": "failed", "error": str(e)}
+
+
+# ── DEPRECATED: Old endpoints kept for emergency fallback ─────
 
 def _mt5_broadcast(payload: dict) -> dict:
-    """
-    Send a single broadcast request to the Contabo MT5 server.
-    Replaces 53 individual /trade calls with 1 /trade/broadcast call.
-    """
+    """Legacy broadcast endpoint — kept for emergency fallback only."""
     try:
         response = requests.post(
             f"{MT5_SERVER_URL}/trade/broadcast",
@@ -52,12 +67,12 @@ def _mt5_broadcast(payload: dict) -> dict:
 
 
 def _mt5_trade(payload: dict) -> dict:
-    """Legacy single-trade endpoint — kept for fallback."""
+    """Legacy single-trade endpoint — kept for emergency fallback."""
     try:
         response = requests.post(
             f"{MT5_SERVER_URL}/trade",
             json=payload,
-            timeout=5  # OPTIMIZED: was 30
+            timeout=5
         )
         return response.json()
     except Exception as e:
@@ -65,77 +80,71 @@ def _mt5_trade(payload: dict) -> dict:
         return {"status": "failed", "error": str(e)}
 
 
-def _mt5_close(payload: dict) -> dict:
-    """Send a close request to the Contabo MT5 server."""
-    try:
-        response = requests.post(
-            f"{MT5_SERVER_URL}/close",
-            json=payload,
-            timeout=5  # OPTIMIZED: was 30
-        )
-        return response.json()
-    except Exception as e:
-        logger.error("MT5 server close request failed: %s", str(e))
-        return {"status": "failed", "error": str(e)}
-
-
-# ── Batch Broadcast Execution (NEW - OPTIMIZED) ───────────────
+# ── Batch Signal Dispatch (NEW — EA Architecture) ─────────────
 
 def execute_batch_broadcast(students: list[dict], signal: dict) -> dict:
     """
-    Execute trade for ALL students in a single broadcast request.
-    Called by Celery task instead of per-student loop.
+    Dispatch signal to ALL students in one request.
+    Manager writes individual files; EA slaves execute inside MT5.
     """
     if not MT5_AVAILABLE:
-        logger.info("[SIMULATION] Would broadcast trade to %d students", len(students))
+        logger.info("[SIMULATION] Would signal %d students", len(students))
         return {"status": "simulated", "student_count": len(students)}
     
+    trader_id = signal.get("trader_id", "")
+    if not trader_id and students:
+        trader_id = students[0].get("trader_id", "")
+    
     payload = {
+        "action":        "OPEN",
         "symbol":        signal.get("symbol"),
         "order_type":    signal.get("order_type", "BUY"),
         "volume":        signal.get("lot_size", 0.01),
-        "mentor_ticket": signal.get("ticket_id", "")
+        "mentor_ticket": signal.get("ticket_id", ""),
+        "trader_id":     trader_id,
+        "stop_loss":     signal.get("stop_loss", 0),
+        "take_profit":   signal.get("take_profit", 0),
     }
     
-    logger.info("📡 Broadcasting trade to %d students via /trade/broadcast", len(students))
-    result = _mt5_broadcast(payload)
+    logger.info("📡 Signalling %d students (trader=%s)", len(students), trader_id)
+    result = _mt5_signal(payload)
     
-    # Log individual results to trade_logs
-    broadcast_results = result.get("results", [])
-    for student in students:
-        user_id = student.get("user_id")
-        login = student.get("mt5_login")
+    if result.get("status") == "written":
+        files_written = result.get("files_written", 0)
+        files_failed = result.get("files_failed", 0)
+        logger.info("✅ Signals written: %d/%d (failed: %d)", 
+                    files_written, len(students), files_failed)
         
-        # Find result for this student
-        student_result = next(
-            (r for r in broadcast_results if r.get("login") == int(login)),
-            {"status": "failed", "error": "No result from broadcast"}
-        )
-        
-        risk = student.get("risk_profiles", {})
-        if isinstance(risk, list):
-            risk = risk[0] if risk else {}
-        
-        if student_result.get("status") == "success":
+        for student in students:
+            user_id = student.get("user_id")
+            risk = student.get("risk_profiles", {})
+            if isinstance(risk, list):
+                risk = risk[0] if risk else {}
+            
             _log_trade(
-                user_id, signal, risk,
+                user_id=user_id,
+                signal=signal,
+                risk=risk,
                 lot=float(signal.get("lot_size", 0.01)),
-                student_ticket=str(student_result.get("ticket", "")),
-                entry_price=student_result.get("price")
+                student_ticket="queued",
+                entry_price=None,
             )
-        else:
-            error = student_result.get("error", "Broadcast execution failed")
-            _log_failure(user_id, signal, error, lot=float(signal.get("lot_size", 0.01)))
+    else:
+        error = result.get("error", "Signal dispatch failed")
+        logger.error("❌ Signal dispatch failed: %s", error)
+        for student in students:
+            _log_failure(student.get("user_id"), signal, error)
     
     return result
 
 
-# ── Main Entry Point (Legacy - kept for compatibility) ────────
+# ── Main Entry Point (Legacy — kept for compatibility) ────────
 
 def execute_for_student(student: dict, signal: dict) -> Outcome:
     """
-    Execute a copy trade for one student.
-    NOTE: Prefer execute_batch_broadcast() for multiple students.
+    DEPRECATED: Single-student execution.
+    New architecture uses execute_batch_broadcast() exclusively.
+    Kept for emergency fallback only.
     """
     user_id     = student.get("user_id")
     folder_path = student.get("folder_path")
@@ -214,32 +223,35 @@ def execute_for_student(student: dict, signal: dict) -> Outcome:
         return _log_failure(user_id, signal, error, lot=final_lot)
 
 
-# ── Close Trade ───────────────────────────────────────────────
+# ── Close Trade (NEW — EA Architecture) ───────────────────────
 
 def close_for_student(student: dict, close_data: dict) -> Outcome:
-    """Close the student's LB-opened positions for the given symbol."""
+    """
+    Dispatch close signal. With EA architecture, one call per trader_id
+    closes all matching students. Per-student calls are redundant but safe.
+    """
     user_id = student.get("user_id")
 
     if not MT5_AVAILABLE:
-        logger.info("[SIMULATION] Would close trade for student %s", user_id)
         return "skipped"
+
+    trader_id = student.get("trader_id", "")
 
     payload = {
-        "login":    student.get("mt5_login"),
-        "password": student.get("encrypted_password"),
-        "server":   student.get("mt5_server"),
-        "symbol":   close_data.get("symbol"),
-        "magic":    LB_MAGIC_NUMBER,
+        "action":        "CLOSE_SYMBOL",
+        "symbol":        close_data.get("symbol"),
+        "order_type":    "SELL",
+        "volume":        0,
+        "mentor_ticket": close_data.get("mentor_ticket", ""),
+        "trader_id":     trader_id,
     }
 
-    result = _mt5_close(payload)
+    result = _mt5_signal(payload)
 
-    if result.get("status") == "skipped":
-        return "skipped"
-    elif result.get("status") == "success":
-        return "closed"
+    if result.get("status") == "written":
+        return "success"
     else:
-        error = result.get("error", "close failed")
+        error = result.get("error", "Close dispatch failed")
         _update_connection_status(user_id, "ERROR", error)
         return "failed"
 
@@ -267,7 +279,7 @@ def _log_trade(
             "entry_price":    entry_price or signal.get("entry_price"),
             "stop_loss":      signal.get("stop_loss"),
             "take_profit":    signal.get("take_profit"),
-            "status":         "simulated" if simulated else "success",
+            "status":         "simulated" if simulated else "queued",
             "strategy_type":  signal.get("strategy_type", "normal"),
             "error_message":  "[SIMULATED]" if simulated else None,
             "executed_at":    datetime.now(timezone.utc).isoformat()

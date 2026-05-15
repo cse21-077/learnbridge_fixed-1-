@@ -4,6 +4,7 @@
 # All inbound signals from the Mentor EA hit these endpoints.
 # Every request is HMAC-verified and timestamp-checked before
 # any processing occurs.
+# Updated for EA Slave Architecture (v3.0)
 # ============================================================
 
 import logging
@@ -16,7 +17,7 @@ from app.models.payloads import (
 )
 from app.services.security import validate_webhook_request
 from app.services.supabase_service import (
-    get_all_active_students,
+    get_active_students,        # ← CHANGED: filters by trader_id
     update_heartbeat,
     log_system_event
 )
@@ -39,7 +40,7 @@ settings   = get_settings()
     response_model=SignalResponse,
     summary="Receive trade signal from Mentor EA",
     description=(
-        "Validates HMAC signature and timestamp, fetches all active students, "
+        "Validates HMAC signature and timestamp, fetches active students for this trader, "
         "splits into batches, and dispatches one Celery task per batch. "
         "Returns immediately after dispatching — does not wait for execution."
     )
@@ -51,16 +52,18 @@ async def handle_signal(payload: SignalPayload, request: Request) -> SignalRespo
 
     Flow:
     1. Validate HMAC + timestamp
-    2. Fetch active students
+    2. Fetch active students for this trader_id (CRITICAL: not all students)
     3. Chunk into batches
     4. Dispatch Celery tasks
     5. Return 200 immediately
     """
     signal_id = str(uuid.uuid4())
+    trader_id = payload.data.trader_id  # ← ADDED
 
     logger.info(
-        "Signal received | id=%s | symbol=%s | type=%s | lot=%.2f | strategy=%s",
+        "Signal received | id=%s | trader=%s | symbol=%s | type=%s | lot=%.2f | strategy=%s",
         signal_id,
+        trader_id,
         payload.data.symbol,
         payload.data.order_type.value,
         payload.data.lot_size,
@@ -70,15 +73,15 @@ async def handle_signal(payload: SignalPayload, request: Request) -> SignalRespo
     # Step 1: Verify HMAC and timestamp
     validate_webhook_request(payload.model_dump(), payload.signature)
 
-    # Step 2: Fetch all eligible students
+    # Step 2: Fetch students for THIS TRADER ONLY (CRITICAL FIX)
     try:
-        students = get_all_active_students()
+        students = get_active_students(trader_id)
     except Exception as e:
         logger.error("Failed to fetch students for signal %s: %s", signal_id, str(e))
         raise HTTPException(status_code=503, detail="Database unavailable")
 
     if not students:
-        logger.warning("Signal %s received but no active students found.", signal_id)
+        logger.warning("Signal %s received but no active students found for trader %s.", signal_id, trader_id)
         return SignalResponse(
             status="dispatched_no_students",
             student_count=0,
@@ -87,6 +90,7 @@ async def handle_signal(payload: SignalPayload, request: Request) -> SignalRespo
         )
 
     # Step 3: Build signal dict for Celery (JSON-serialisable)
+    # Includes trader_id so the Contabo manager filters correctly
     signal_dict = {
         "ticket_id":     payload.data.ticket_id,
         "symbol":        payload.data.symbol,
@@ -96,6 +100,7 @@ async def handle_signal(payload: SignalPayload, request: Request) -> SignalRespo
         "stop_loss":     payload.data.stop_loss,
         "take_profit":   payload.data.take_profit,
         "strategy_type": payload.data.strategy_type.value,
+        "trader_id":     trader_id,                    # ← ADDED
         "signal_id":     signal_id,
         "received_at":   datetime.now(timezone.utc).isoformat()
     }
@@ -107,8 +112,8 @@ async def handle_signal(payload: SignalPayload, request: Request) -> SignalRespo
         execute_trade_batch.delay(batch, signal_dict)
 
     logger.info(
-        "Signal %s dispatched | %d students | %d batches",
-        signal_id, len(students), len(batches)
+        "Signal %s dispatched | trader=%s | %d students | %d batches",
+        signal_id, trader_id, len(students), len(batches)
     )
 
     # Step 5: Audit log (non-blocking)
@@ -116,6 +121,7 @@ async def handle_signal(payload: SignalPayload, request: Request) -> SignalRespo
         event_type="signal_dispatched",
         payload={
             "signal_id":     signal_id,
+            "trader_id":     trader_id,
             "ticket_id":     payload.data.ticket_id,
             "symbol":        payload.data.symbol,
             "strategy_type": payload.data.strategy_type.value,
@@ -143,18 +149,19 @@ async def handle_signal(payload: SignalPayload, request: Request) -> SignalRespo
 async def handle_close(payload: ClosePayload, request: Request) -> CloseResponse:
     """
     Triggered when Mentor closes a position.
-    Dispatches close tasks to all students who have that position open.
+    Dispatches close tasks to students under THIS TRADER ONLY.
     """
     logger.info(
-        "Close signal received | ticket=%s | symbol=%s",
-        payload.mentor_ticket, payload.symbol
+        "Close signal received | trader=%s | ticket=%s | symbol=%s",
+        payload.trader_id, payload.mentor_ticket, payload.symbol
     )
 
     # Verify HMAC + timestamp
     validate_webhook_request(payload.model_dump(), payload.signature)
 
+    # Fetch students for THIS TRADER ONLY (CRITICAL FIX)
     try:
-        students = get_all_active_students()
+        students = get_active_students(payload.trader_id)
     except Exception as e:
         raise HTTPException(status_code=503, detail="Database unavailable")
 
@@ -167,7 +174,8 @@ async def handle_close(payload: ClosePayload, request: Request) -> CloseResponse
 
     close_data = {
         "mentor_ticket": payload.mentor_ticket,
-        "symbol":        payload.symbol
+        "symbol":        payload.symbol,
+        "trader_id":     payload.trader_id  # ← ADDED
     }
 
     batches = chunk_list(students, settings.batch_size)
@@ -175,8 +183,8 @@ async def handle_close(payload: ClosePayload, request: Request) -> CloseResponse
         execute_close_batch.delay(batch, close_data)
 
     logger.info(
-        "Close dispatched for ticket %s | %d students | %d batches",
-        payload.mentor_ticket, len(students), len(batches)
+        "Close dispatched for trader %s ticket %s | %d students | %d batches",
+        payload.trader_id, payload.mentor_ticket, len(students), len(batches)
     )
 
     return CloseResponse(

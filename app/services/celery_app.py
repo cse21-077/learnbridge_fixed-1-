@@ -1,8 +1,8 @@
 # app/services/celery_app.py
 # ============================================================
-# LEAN-BRIDGE — CELERY APPLICATION (OPTIMIZED v2.0)
-# Task queue configuration, worker pre-warming, and task definitions.
-# OPTIMIZATION: execute_trade_batch now uses broadcast endpoint
+# LEAN-BRIDGE — CELERY APPLICATION (EA Architecture v3.0)
+# Task queue configuration and task definitions.
+# Updated for file-based EA execution.
 # ============================================================
 
 import logging
@@ -62,7 +62,7 @@ celery_app.conf.update(
 )
 
 
-# ── Worker Pre-Warming ────────────────────────────────────────
+# ── Worker Pre-Warming (DEPRECATED but kept for compatibility) ─
 
 _worker_terminal_paths: dict[str, str] = {}
 _worker_id: int = 0
@@ -74,29 +74,9 @@ def init_worker_state(**kwargs):
     global _worker_id, _worker_terminal_paths
 
     _worker_id = int(os.environ.get("WORKER_INDEX", 0))
-    logger.info("Worker %d initialised. Pre-loading terminal path cache...", _worker_id)
-
-    try:
-        from app.services.supabase_service import get_supabase
-        supabase = get_supabase()
-
-        result = (
-            supabase.table("student_accounts")
-            .select("user_id, folder_path, mt5_login")
-            .eq("is_active", True)
-            .not_.is_("folder_path", "null")
-            .execute()
-        )
-
-        if result.data:
-            _worker_terminal_paths = {
-                row["user_id"]: row["folder_path"]
-                for row in result.data
-            }
-            logger.info("Worker %d: cached %d terminal paths", _worker_id, len(_worker_terminal_paths))
-
-    except Exception as e:
-        logger.error("Worker %d: failed to pre-load terminal paths: %s", _worker_id, str(e))
+    logger.info("Worker %d initialised.", _worker_id)
+    # Terminal path cache is no longer needed with EA architecture,
+    # but kept for compatibility with legacy fallback mode.
 
 
 @worker_process_shutdown.connect
@@ -106,7 +86,7 @@ def cleanup_worker(**kwargs):
 
 
 def get_terminal_path(user_id: str) -> str | None:
-    """Return cached terminal folder path for a student."""
+    """Return cached terminal folder path for a student. (Legacy)"""
     if user_id in _worker_terminal_paths:
         return _worker_terminal_paths[user_id]
 
@@ -130,7 +110,7 @@ def get_terminal_path(user_id: str) -> str | None:
     return None
 
 
-# ── Celery Tasks (OPTIMIZED) ──────────────────────────────────
+# ── Celery Tasks (UPDATED for EA Architecture) ────────────────
 
 @celery_app.task(
     bind=True,
@@ -141,51 +121,33 @@ def get_terminal_path(user_id: str) -> str | None:
 )
 def execute_trade_batch(self, students: list[dict], signal: dict) -> dict:
     """
-    OPTIMIZED: Single broadcast instead of per-student loop.
-    Reduces 53 HTTP requests → 1 broadcast request.
+    Dispatch trade signal to all students via the EA-based manager.
+    Single HTTP request to /signal endpoint.
     """
-    from app.services.trade_executor import execute_batch_broadcast, execute_for_student
-    from app.config import get_settings
+    from app.services.trade_executor import execute_batch_broadcast
     
-    settings = get_settings()
-    
-    # Check if broadcast is enabled (can be toggled via env)
-    use_broadcast = os.environ.get("USE_BROADCAST", "true").lower() == "true"
-    
-    if use_broadcast:
-        logger.info("📡 Using BROADCAST mode for %d students", len(students))
-        try:
-            result = execute_batch_broadcast(students, signal)
-            
-            return {
-                "success": result.get("successes", 0),
-                "failed": result.get("failures", 0),
-                "skipped": 0,
-                "total": result.get("total", 0),
-                "mode": "broadcast"
-            }
-        except Exception as e:
-            logger.error("Broadcast failed, falling back to per-student: %s", str(e))
-            # Fall through to legacy mode
-    
-    # Legacy mode (fallback or if broadcast disabled)
-    logger.info("Using LEGACY per-student mode for %d students", len(students))
-    results = {"success": 0, "failed": 0, "skipped": 0, "retried": 0, "mode": "legacy"}
-    
-    for student in students:
-        try:
-            outcome = execute_for_student(student, signal)
-            results[outcome] = results.get(outcome, 0) + 1
-        except Exception as e:
-            logger.error("Unhandled error for student %s: %s", student.get("user_id"), str(e))
-            results["failed"] += 1
-            
-            if self.request.retries >= self.max_retries:
-                _write_dead_letter(self.request.id, student, signal, str(e))
-    
-    logger.info("Batch complete. Success: %d, Failed: %d, Skipped: %d", 
-                results["success"], results["failed"], results["skipped"])
-    return results
+    logger.info("📡 Using EA SIGNAL mode for %d students", len(students))
+    try:
+        result = execute_batch_broadcast(students, signal)
+        
+        # Parse new manager response format
+        return {
+            "success": result.get("files_written", 0),
+            "failed": result.get("files_failed", 0),
+            "skipped": 0,
+            "total": result.get("students_total", 0),
+            "mode": "ea_signal"
+        }
+    except Exception as e:
+        logger.error("EA signal dispatch failed: %s", str(e))
+        return {
+            "success": 0,
+            "failed": len(students),
+            "skipped": 0,
+            "total": len(students),
+            "mode": "ea_signal",
+            "error": str(e)
+        }
 
 
 @celery_app.task(
@@ -198,6 +160,7 @@ def execute_trade_batch(self, students: list[dict], signal: dict) -> dict:
 def execute_close_batch(self, students: list[dict], close_data: dict) -> dict:
     """
     Close all open positions for a batch of students.
+    With EA architecture, each call dispatches a close signal.
     """
     from app.services.trade_executor import close_for_student
 
