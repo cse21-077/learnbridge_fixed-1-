@@ -54,7 +54,7 @@ celery_app.conf.update(
             "options":  {"expires": 3600}
         },
         "check-heartbeat-status": {
-            "task":     "app.services.celery_app.check_heartbeat_status",
+            "task":     "check_heartbeat_status",
             "schedule": 60,
             "options":  {"expires": 30}
         }
